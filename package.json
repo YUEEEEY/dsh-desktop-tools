@@ -1,7 +1,7 @@
 {
   "name": "dsh-desktop-tools",
   "version": "0.1.2",
-  "description": "dsh 环境管理插件（纯插件，无桌面壳依赖）：桌面窗口宿主（Rust/Tauri）管理、运行时版本管理与更新、Windows 补丁（win32 进程检查器 / minimal preset pwsh）、DeepSeek 计费与综合面板（/panel、/billing、/api/runtime、/api/patches、/api/billing、/api/desktop）。",
+  "description": "dsh 环境管理插件（纯插件，无桌面壳依赖）：桌面窗口宿主（Rust/Tauri）管理、运行时版本管理与更新、Windows 补丁（win32 进程检查器 / minimal preset pwsh）、DeepSeek 计费与综合面板（/panel、/billing、/api/runtime、/api/patches、/api/desktop）。",
   "type": "module",
   "main": "lib/index.js",
   "bin": {
@@ -21,6 +21,14 @@
       "patch": "./cordis.patch.yml"
     }
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YUEEEEY/dsh-desktop-tools.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YUEEEEY/dsh-desktop-tools/issues"
+  },
+  "homepage": "https://github.com/YUEEEEY/dsh-desktop-tools#readme",
   "license": "MIT",
   "peerDependencies": {
     "@deepseek-ai/schemastery": "^3.18.1"
