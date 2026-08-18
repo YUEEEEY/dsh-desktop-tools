@@ -39,6 +39,7 @@ dsh plugin --profile web add file:<本插件目录>
 
 - 宿主二进制内嵌于插件包 `desktop/win32-x64/dsh-desktop.exe`（Rust/Tauri v2）
 - `dsh web --no-desktop` 关闭自动开窗；`dsh web --desktop` 强制打开
+- 桌面窗口内：`Ctrl+Shift+P` 打开环境面板、`Ctrl+Shift+H` 回到主界面（或菜单"视图"）
 - 配置项 `autoOpenDesktop`（默认 `true`）控制默认行为
 - 宿主定位顺序：`desktopBin` 配置 → `DSH_DESKTOP_BIN` 环境变量 → 插件内嵌 → 仓库构建 → PATH
 
