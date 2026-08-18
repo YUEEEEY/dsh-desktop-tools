@@ -1,0 +1,8 @@
+# dsh-desktop-tools bundle patch: mount the desktop-tools plugin into the tree.
+# Applied after the base/web-app/community bundle layers, so ctx.webServer
+# (provided by dsh-host-webserver) is already present when this row loads.
+- insert:
+    - id: desktop-tools
+      name: 'dsh-desktop-tools'
+      config:
+        autoApplyPatches: true
