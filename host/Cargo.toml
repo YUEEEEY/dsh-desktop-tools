@@ -1,0 +1,22 @@
+[package]
+name = "dsh-desktop"
+version = "0.1.0"
+description = "DSH Desktop 窗口宿主（由 dsh-desktop-tools 插件拉起）：以 WebView 封装 dsh web 界面，并负责启动/看护服务进程。所有环境能力（更新/补丁/面板/计费）由 dsh 插件承担。"
+authors = ["dsh-desktop"]
+license = "MIT"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+opener = "0.7"
+dirs = "5"
+tokio = { version = "1", features = ["time"] }
+
+[profile.release]
+strip = true
+panic = "abort"

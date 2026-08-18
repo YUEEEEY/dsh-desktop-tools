@@ -6,7 +6,7 @@
 //
 // 宿主定位顺序：
 //   1) 环境变量 DSH_DESKTOP_BIN
-//   2) 插件内嵌：<dsh-env>/plugins/dsh-desktop-tools/desktop/win32-x64/dsh-desktop(.exe)
+//   2) 插件内嵌：<插件包>/desktop/<platform>-<arch>/dsh-desktop(.exe)
 //   3) 仓库内开发构建：<dsh-env>/host/target/release/dsh-desktop(.exe)
 //   4) PATH 中的 dsh-desktop
 import { existsSync } from "node:fs";
@@ -18,13 +18,22 @@ import { spawn } from "node:child_process";
 const isWin = process.platform === "win32";
 const exeName = isWin ? "dsh-desktop.exe" : "dsh-desktop";
 
+function hostPlatformDir() {
+  const p = process.platform;
+  const a = process.arch;
+  if (p === "win32") return "win32-x64";
+  if (p === "darwin") return a === "arm64" ? "darwin-arm64" : "darwin-x64";
+  if (p === "linux") return a === "arm64" ? "linux-arm64" : "linux-x64";
+  return `${p}-${a}`;
+}
+
 function locateHost() {
   if (process.env.DSH_DESKTOP_BIN && existsSync(process.env.DSH_DESKTOP_BIN)) {
     return process.env.DSH_DESKTOP_BIN;
   }
-  // 插件内嵌：plugins/dsh-desktop-tools/bin/ → ../desktop/win32-x64/
+  // 插件内嵌：plugins/dsh-desktop-tools/bin/ → ../desktop/<platform>-<arch>/
   const here = dirname(fileURLToPath(import.meta.url));
-  const embedded = join(here, "..", "desktop", "win32-x64", exeName);
+  const embedded = join(here, "..", "desktop", hostPlatformDir(), exeName);
   if (existsSync(embedded)) return embedded;
   const dev = join(here, "..", "..", "..", "host", "target", "release", exeName);
   if (existsSync(dev)) return dev;
@@ -70,6 +79,6 @@ const child = spawn(host, args, {
 child.on("exit", (code) => process.exit(code ?? 0));
 child.on("error", (e) => {
   console.error(`[dsh-desktop] 启动宿主失败：${e.message}`);
-  console.error(`[dsh-desktop] 请先在 dsh-env/desktop 运行 cargo build --release`);
+  console.error(`[dsh-desktop] 请先在 dsh-env/host 运行 cargo build --release`);
   process.exit(1);
 });

@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"默认能力：事件监听与命令调用","local":true,"windows":["main"],"permissions":["core:default"]}}
