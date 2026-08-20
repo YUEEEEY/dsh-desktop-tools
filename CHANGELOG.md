@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1 — 2026-08-20
+
+- Code editor UX overhaul (Qoder/WorkBuddy-style): conversation view ↔ code view
+  switching — a floating "⌘ 代码" button on the chat page opens the editor, and the
+  editor's top bar switches back to the chat view.
+- The code view embeds the conversation in a resizable left sidebar (same-origin
+  iframe), so the chat stays visible while editing; the file tree sits beside it.
+- Editor fixes: multi-file tabs with unsaved markers and per-tab close, a status
+  bar (path/language/line-col/save state), Monaco loaded from the npmmirror CDN
+  first (China-friendly) with jsdelivr fallback and a built-in editor as last
+  resort, and active-file highlighting in the tree.
+
 ## 0.4.0 — 2026-08-20
 
 - Host auto-install: installing the plugin fetches the matching `dsh-desktop-host`

@@ -61,11 +61,17 @@ Host lookup order: `desktopBin` config → `DSH_DESKTOP_BIN` env → auto-fetch 
 
 ## Code editor
 
-Opened inside the main window (`Ctrl+Shift+E` / tray / menu) for reading and editing workspace files:
+**Conversation view ⇄ Code view** two-way switching (Qoder / WorkBuddy-style):
 
-- file tree on the left (`.git` / `node_modules` etc. skipped), editor on the right, language detected by extension;
-- `Ctrl+S` saves to disk; `Ctrl+Shift+B` or the in-page back button returns to the main view;
-- Monaco-based editor (loaded on demand; a built-in editor is used when offline);
+- a floating "⌘ 代码" button on the chat page (or the host menu/tray, `Ctrl+Shift+E`) opens the code view;
+- the code view's top bar switches back to the chat view ("对话" / `Ctrl+B`).
+
+Code view layout:
+
+- **Conversation sidebar on the left**: embeds the live session (draggable width, collapsible) — chat stays visible while editing;
+- **File tree**: workspace browsing (`.git` / `node_modules` etc. skipped, lazy expansion);
+- **Multi-tab editor**: language detected by extension, `Ctrl+S` saves, unsaved markers, status bar (path/language/line-col);
+- Monaco-based editor (npmmirror CDN first, jsdelivr fallback, built-in editor when offline);
 - the file API (`/api/fs/tree|read|write`) is strictly confined to the workspace root and loopback-only;
 - default root is the dsh workspace; override with the `editorRoot` config.
 

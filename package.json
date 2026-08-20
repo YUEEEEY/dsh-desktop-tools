@@ -1,6 +1,6 @@
 {
   "name": "dsh-desktop-tools",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "dsh 环境管理插件（TypeScript）：安装即自动配备桌面窗口宿主（Rust/Tauri，按系统下载或构建），运行时版本管理与一键更新、平台兼容自动适配、DeepSeek 官方计费面板，以及内置代码编辑器（工作区文件浏览/编辑）。",
   "type": "module",
   "main": "lib/index.js",
