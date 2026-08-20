@@ -13,7 +13,6 @@
   "files": [
     "lib",
     "bin",
-    "desktop",
     "cordis.patch.yml"
   ],
   "scripts": {
