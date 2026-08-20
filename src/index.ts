@@ -1,23 +1,31 @@
 // dsh-desktop-tools —— dsh 环境管理插件（纯插件，无桌面壳依赖）
 //
 // 提供（注册在 dsh web profile 的 HTTP 路由上）：
-//   /panel            综合面板（运行时版本 / 更新 / 补丁 / 计费摘要）
+//   /panel            环境面板（宿主状态 / 运行时版本与更新 / 平台兼容 / 计费摘要）
 //   /billing          计费页（余额 + 全部会话 token 用量 + 估算花费）
+//   /editor           代码编辑器（工作区文件浏览 / 编辑，宿主主窗口内打开）
 //   /api/runtime      GET 状态 / POST 触发后台更新（npm install）
 //   /api/runtime/log  更新日志尾部 + 是否仍在运行
-//   /api/patches      GET 状态 / POST 重新应用 Windows 补丁
+//   /api/patches      GET 平台兼容状态 / POST 重新应用
+//   /api/desktop      GET 宿主状态 / POST 打开桌面窗口
+//   /api/host/ensure  POST 触发宿主自动获取（Release 下载 / 源码构建）
+//   /api/fs/tree|read|write  代码编辑器的文件 API（限定在工作区根内）
 //   /api/billing      计费 JSON
 //
 // 安装方式（无壳，dsh 原生插件）：
-//   dsh plugin --profile web add file:<本包目录>   # 本地/仓库内引用
-//   或发布到 npm / git 后：dsh plugin --profile web add dsh-desktop-tools
+//   dsh plugin --profile web add dsh-desktop-tools   # npm / git 均可
+//
+// 宿主自动获取：安装时（postinstall）与插件加载时（惰性兜底）自动执行
+// scripts/ensure-host.mjs —— 优先下载 dsh-desktop-host 最新 Release 对应平台的
+// 二进制到 $DSH_HOME/desktop-host/<platform>-<arch>/，无 Release 则 clone 源码
+// cargo build --release；全部失败时插件照常工作（仅无桌面窗口）。
 //
 // 运行时定位顺序（补丁/更新目标）：
 //   1) 环境变量 DSH_RUNTIME_DIR（桌面壳兼容模式，显式指定运行时）
 //   2) 当前正在运行的 dsh 实例（process.argv[1] → <安装>/lib/bin.js）
 //   3) npm 全局安装的 @deepseek-ai/dsh
 //   4) 插件自身所在运行时的目录上溯
-// 无法定位时，补丁与更新功能报告“未定位到 dsh 安装”，其余照常。
+// 无法定位时，补丁与更新功能报告"未定位到 dsh 安装"，其余照常。
 
 import {
   existsSync,
@@ -30,8 +38,10 @@ import {
   closeSync,
   appendFileSync,
   mkdirSync,
+  readdirSync,
+  readlinkSync,
 } from "node:fs";
-import { join, dirname, resolve } from "node:path";
+import { join, dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { createConnection } from "node:net";
@@ -42,7 +52,7 @@ const name = "desktop-tools";
 const inject = ["webServer", "cmdlineArgs"];
 
 const Config = z.object({
-  /** 插件加载时自动重打 Windows 补丁（幂等），默认开启 */
+  /** 插件加载时自动重打平台兼容补丁（幂等），默认开启 */
   autoApplyPatches: z.boolean().default(true),
   /** 加载时异步检查 dsh 最新版本，发现新版时打印提示（可在面板手动更新），默认开启 */
   checkUpdatesOnLaunch: z.boolean().default(true),
@@ -50,10 +60,14 @@ const Config = z.object({
   updateMode: z
     .union([z.const("auto"), z.const("global"), z.const("prefix")])
     .default("auto"),
-  /** 桌面窗口宿主二进制路径（Rust/Tauri 编译产物 dsh-desktop.exe）；留空自动定位（插件内嵌 → 仓库构建 → PATH） */
+  /** 桌面窗口宿主二进制路径（Rust/Tauri 编译产物 dsh-desktop.exe）；留空自动定位（缓存目录 → 仓库构建 → PATH） */
   desktopBin: z.string().default(""),
+  /** 是否自动获取宿主二进制（安装时 / 加载时），默认开启 */
+  hostAutoInstall: z.boolean().default(true),
   /** dsh web 启动后自动打开桌面端窗口（可用 `dsh web --no-desktop` 关闭），默认开启 */
   autoOpenDesktop: z.boolean().default(true),
+  /** 代码编辑器根目录（缺省为 dsh 工作区 / 当前目录） */
+  editorRoot: z.string().default(""),
   /** 估算单价（¥/百万 tokens），默认按 DeepSeek-V4-Flash 官方空闲时段价 */
   prices: z
     .object({
@@ -70,7 +84,7 @@ const Config = z.object({
 const IS_WIN = process.platform === "win32";
 /** npm 命令名（Windows 为 npm.cmd） */
 const NPM_BIN = IS_WIN ? "npm.cmd" : "npm";
-/** 宿主二进制平台目录（插件包 desktop/<platform>-<arch>/） */
+/** 宿主二进制平台目录（与 ensure-host.mjs / 宿主 Release 资产命名一致） */
 function hostPlatformDir() {
   const p = process.platform;
   const a = process.arch;
@@ -282,7 +296,7 @@ function runtimeStatus() {
   };
 }
 
-/* ---------------- Windows 补丁 ---------------- */
+/* ---------------- 平台兼容（Windows 自动适配） ---------------- */
 
 const WINDOWS_INSPECTOR_SOURCE = `var WindowsProcessInspector = class {
 	constructor(internals) {
@@ -346,11 +360,11 @@ function subprocessCheck() {
   try {
     const content = readFileSync(file, "utf8");
     if (content.includes("WindowsProcessInspector")) {
-      return { ok: true, detail: "已打过 win32 补丁" };
+      return { ok: true, detail: "已适配" };
     }
     return {
       ok: false,
-      detail: "未应用（缺少 WindowsProcessInspector）",
+      detail: "未适配（缺少 WindowsProcessInspector）",
       file,
       content,
     };
@@ -360,7 +374,7 @@ function subprocessCheck() {
 }
 
 function patchSubprocessWin32() {
-  if (!IS_WIN) return { ok: true, detail: "非 Windows 平台，无需补丁" };
+  if (!IS_WIN) return { ok: true, detail: "非 Windows 平台，无需适配" };
   const st = subprocessCheck();
   if (st.ok) return st;
   if (!st.file || !st.content) return st;
@@ -380,7 +394,7 @@ function patchSubprocessWin32() {
   } catch (e) {
     return { ok: false, detail: `写入失败：${e.message}` };
   }
-  return { ok: true, detail: "win32 进程检查器补丁已应用" };
+  return { ok: true, detail: "已适配（终端与进程检查）" };
 }
 
 const MINIMAL_EDITS = [
@@ -420,16 +434,16 @@ function minimalPresetCheck() {
   try {
     const content = readFileSync(file, "utf8");
     if (content.includes("persistent-pwsh")) {
-      return { ok: true, detail: "已打过 minimal preset 补丁" };
+      return { ok: true, detail: "已适配" };
     }
-    return { ok: false, detail: "未应用（缺少 persistent-pwsh）", file, content };
+    return { ok: false, detail: "未适配（缺少 persistent-pwsh）", file, content };
   } catch (e) {
     return { ok: false, detail: `读取失败：${e.message}` };
   }
 }
 
 function patchMinimalPresetWin32() {
-  if (!IS_WIN) return { ok: true, detail: "非 Windows 平台，无需补丁" };
+  if (!IS_WIN) return { ok: true, detail: "非 Windows 平台，无需适配" };
   const st = minimalPresetCheck();
   if (st.ok) return st;
   if (!st.file || !st.content) return st;
@@ -445,17 +459,17 @@ function patchMinimalPresetWin32() {
   } catch (e) {
     return { ok: false, detail: `写入失败：${e.message}` };
   }
-  return { ok: true, detail: "minimal preset win32 补丁已应用（bash 持久终端 → pwsh 工具）" };
+  return { ok: true, detail: "已适配（命令工具 → pwsh）" };
 }
 
 function patchesStatus() {
   return [
     {
       id: "subprocess-local",
-      name: "subprocess-local win32 进程检查器",
+      name: "终端与进程能力",
       ...subprocessCheck(),
     },
-    { id: "minimal-preset", name: "minimal preset → pwsh 工具", ...minimalPresetCheck() },
+    { id: "minimal-preset", name: "命令工具适配", ...minimalPresetCheck() },
   ];
 }
 
@@ -463,12 +477,12 @@ function applyPatches() {
   return [
     {
       id: "subprocess-local",
-      name: "subprocess-local win32 进程检查器",
+      name: "终端与进程能力",
       ...patchSubprocessWin32(),
     },
     {
       id: "minimal-preset",
-      name: "minimal preset → pwsh 工具",
+      name: "命令工具适配",
       ...patchMinimalPresetWin32(),
     },
   ];
@@ -646,6 +660,77 @@ function readLogTail(maxBytes = 4096) {
   }
 }
 
+/* ---------------- 宿主自动获取 ---------------- */
+
+function hostRootDir() {
+  return join(dshHome(), "desktop-host");
+}
+
+function hostCacheBin() {
+  return join(
+    hostRootDir(),
+    hostPlatformDir(),
+    IS_WIN ? "dsh-desktop.exe" : "dsh-desktop",
+  );
+}
+
+function hostStatusFile() {
+  return join(hostRootDir(), "ensure-status.json");
+}
+
+/** 读取宿主获取状态（ensure-host.mjs 写入） */
+function hostStatus() {
+  try {
+    const p = hostStatusFile();
+    if (existsSync(p)) return JSON.parse(readFileSync(p, "utf8"));
+  } catch {
+    /* ignore */
+  }
+  const bin = hostCacheBin();
+  if (existsSync(bin)) return { state: "ready", path: bin, source: "已存在" };
+  return { state: "missing" };
+}
+
+/**
+ * 惰性触发宿主获取（后台 detached 进程）。
+ * 安装时的 postinstall 已执行过一次；这里是兜底（如 pnpm file: 安装不跑脚本）。
+ */
+function spawnHostEnsure() {
+  const st = hostStatus();
+  if (st.state === "ready" || st.state === "running") return st;
+  try {
+    mkdirSync(hostRootDir(), { recursive: true });
+    writeFileSync(
+      hostStatusFile(),
+      JSON.stringify({ at: new Date().toISOString(), state: "running" }),
+      "utf8",
+    );
+  } catch {
+    /* ignore */
+  }
+  const script = join(pluginRoot(), "scripts", "ensure-host.mjs");
+  if (!existsSync(script)) {
+    const err = "缺少 scripts/ensure-host.mjs（插件安装不完整）";
+    try {
+      writeFileSync(hostStatusFile(), JSON.stringify({ state: "failed", error: err }), "utf8");
+    } catch {
+      /* ignore */
+    }
+    return { state: "failed", error: err };
+  }
+  try {
+    const child = spawn(process.execPath, [script], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    child.unref();
+    return { state: "running", pid: child.pid };
+  } catch (e) {
+    return { state: "failed", error: String(e?.message ?? e) };
+  }
+}
+
 /* ---------------- 桌面宿主 ---------------- */
 
 let desktopBin = "";
@@ -654,13 +739,16 @@ let currentPort = 3080;
 
 /** 定位 Rust 桌面宿主（dsh-desktop）：
  *  1) Config.desktopBin  2) 环境变量 DSH_DESKTOP_BIN
- *  3) 克隆的宿主源码构建产物 <dsh-env>/host/target/release/  4) PATH
- *  （宿主源码独立仓库：https://github.com/YUEEEEY/dsh-desktop-host，按系统 cargo build 后设置 DSH_DESKTOP_BIN） */
+ *  3) 自动获取缓存目录 <DSH_HOME>/desktop-host/<platform>-<arch>/
+ *  4) 克隆的宿主源码构建产物 <dsh-env>/host/target/release/  5) PATH
+ *  （宿主源码独立仓库：https://github.com/YUEEEEY/dsh-desktop-host，
+ *    安装插件时会自动下载/构建对应平台二进制，无需手动处理） */
 function desktopHostPath() {
   const exeName = IS_WIN ? "dsh-desktop.exe" : "dsh-desktop";
   const cands = [
     desktopBin,
     process.env.DSH_DESKTOP_BIN,
+    hostCacheBin(),
     join(pluginRoot(), "..", "..", "..", "host", "target", "release", exeName),
     exeName,
   ];
@@ -678,13 +766,19 @@ function desktopHostPath() {
 async function desktopStatus() {
   const bin = desktopHostPath();
   const exists = bin ? existsSync(bin) : false;
+  const acq = hostStatus();
   return {
     bin: bin || null,
     exists,
     serverUp: await portUp(currentPort),
+    acquisition: acq,
     hint: exists
       ? "宿主就绪，可打开桌面端"
-      : "未找到宿主二进制——请克隆 https://github.com/YUEEEEY/dsh-desktop-host 后 cargo build --release，并设置 DSH_DESKTOP_BIN 或 desktopBin 配置指向产物",
+      : acq.state === "running"
+        ? "正在自动获取宿主二进制…（Release 下载或源码构建）"
+        : acq.state === "failed"
+          ? `宿主自动获取失败：${acq.error || ""}。可手动构建后设置 DSH_DESKTOP_BIN，或在面板点击"重新获取宿主"。`
+          : "未找到宿主二进制，正在尝试自动获取（也可设置 DSH_DESKTOP_BIN）",
   };
 }
 
@@ -709,7 +803,7 @@ function portUp(port, timeoutMs = 800) {
 async function startDesktop() {
   const bin = desktopHostPath();
   if (!bin || !existsSync(bin)) {
-    return { ok: false, error: "未找到宿主二进制，请重新安装插件（见面板提示）" };
+    return { ok: false, error: "未找到宿主二进制，请等待自动获取完成或重新安装插件（见面板提示）" };
   }
   const up = await portUp(currentPort);
   const args = up
@@ -725,7 +819,131 @@ async function startDesktop() {
   }
 }
 
-/* ---------------- 页面 ---------------- */
+/* ---------------- 代码编辑器：文件 API ---------------- */
+
+let editorRoot = process.cwd();
+
+function resolveInRoot(p) {
+  const root = resolve(editorRoot);
+  const abs = resolve(root, p);
+  if (abs !== root && !abs.startsWith(root + sep)) return undefined;
+  return abs;
+}
+
+function isBinary(buf) {
+  const sample = buf.length > 8192 ? buf.subarray(0, 8192) : buf;
+  for (const b of sample) {
+    if (b === 0) return true;
+  }
+  return false;
+}
+
+function fsTree(dir) {
+  const abs = resolveInRoot(dir || ".");
+  if (!abs) return { error: "路径超出工作区根目录" };
+  let st;
+  try {
+    st = statSync(abs);
+  } catch (e) {
+    return { error: `无法访问：${e.message}` };
+  }
+  if (!st.isDirectory()) return { error: "不是目录" };
+  let names;
+  try {
+    names = readdirSync(abs);
+  } catch (e) {
+    return { error: `读取目录失败：${e.message}` };
+  }
+  const SKIP = new Set([".git", "node_modules", ".dsh", ".cache", "target", "dist"]);
+  const entries = [];
+  for (const n of names) {
+    if (n.startsWith(".") && n !== ".env" && n !== ".env.local") continue;
+    if (SKIP.has(n)) continue;
+    const full = join(abs, n);
+    let isDir = false;
+    let size = 0;
+    try {
+      const s = statSync(full);
+      isDir = s.isDirectory();
+      size = s.size;
+    } catch {
+      try {
+        const l = readlinkSync(full);
+        isDir = l.length > 0 && !l.includes(".");
+      } catch {
+        continue; // 无法访问的条目（权限/symlink 环）跳过
+      }
+    }
+    entries.push({ name: n, path: full, dir: isDir, size });
+    if (entries.length >= 500) break;
+  }
+  entries.sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
+  return { root: abs, entries };
+}
+
+function fsRead(p) {
+  const abs = resolveInRoot(p);
+  if (!abs) return { error: "路径超出工作区根目录" };
+  let st;
+  try {
+    st = statSync(abs);
+  } catch (e) {
+    return { error: `无法访问：${e.message}` };
+  }
+  if (st.isDirectory()) return { error: "这是目录，请选择一个文件" };
+  const MAX = 2 * 1024 * 1024;
+  if (st.size > MAX) return { error: `文件过大（${(st.size / 1024 / 1024).toFixed(1)} MB，上限 2 MB）` };
+  let buf;
+  try {
+    buf = readFileSync(abs);
+  } catch (e) {
+    return { error: `读取失败：${e.message}` };
+  }
+  if (isBinary(buf)) return { error: "二进制文件，无法编辑" };
+  return { path: abs, content: buf.toString("utf8"), truncated: false };
+}
+
+function fsWrite(p, content) {
+  const abs = resolveInRoot(p);
+  if (!abs) return { error: "路径超出工作区根目录" };
+  try {
+    writeFileSync(abs, content, "utf8");
+    return { ok: true, path: abs };
+  } catch (e) {
+    return { error: `写入失败：${e.message}` };
+  }
+}
+
+/* ---------------- 页面（Zed 风格） ---------------- */
+
+const ZED_CSS = `:root{--bg:#0d0f0f;--raise:#141617;--hover:#191c1c;--border:#232626;--text:#d8dcda;--dim:#7d8580;--faint:#5a615d;--accent:#4d6bfe;--green:#3fb68b;--amber:#d19a3d;--red:#e5534b}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,"Segoe UI","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text);font-size:13.5px;line-height:1.55}
+.wrap{max-width:780px;margin:0 auto;padding:28px 20px 48px}
+h1{font-size:17px;font-weight:650;letter-spacing:.01em;margin-bottom:2px}
+.sub{color:var(--dim);font-size:12px;margin-bottom:22px}
+.card{background:var(--raise);border:1px solid var(--border);border-radius:6px;padding:14px 16px;margin-bottom:12px}
+.card h2{font-size:11px;color:var(--faint);font-weight:600;letter-spacing:.09em;text-transform:uppercase;margin-bottom:10px;display:flex;align-items:center;gap:8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+.item{padding:8px 10px;border:1px solid var(--border);border-radius:5px;background:var(--bg)}
+.item label{display:block;font-size:10.5px;color:var(--faint);letter-spacing:.05em;margin-bottom:3px}
+.item span{font-size:13px;font-variant-numeric:tabular-nums;word-break:break-all}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button{font:inherit;font-size:12px;padding:6px 12px;border-radius:5px;border:1px solid var(--border);background:var(--hover);color:var(--text);cursor:pointer}
+button:hover{border-color:var(--accent)}
+button:disabled{opacity:.4;cursor:not-allowed}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.badge{font-size:11px;padding:2px 8px;border-radius:20px;border:1px solid var(--border);color:var(--dim)}
+.badge.ok{color:var(--green);border-color:var(--green)}
+.badge.bad{color:var(--red);border-color:var(--red)}
+.badge.warn{color:var(--amber);border-color:var(--amber)}
+.badge.dim{color:var(--faint)}
+pre.log{background:#0a0b0b;border:1px solid var(--border);border-radius:5px;padding:10px;font-size:11.5px;line-height:1.6;color:#9aa7a0;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow:auto}
+.muted{color:var(--dim);font-size:12px}
+.err{color:var(--red);font-size:12.5px;margin-top:6px}
+details.tech summary{cursor:pointer;color:var(--faint);font-size:11.5px}
+details.tech{margin-top:8px}`;
 
 const BILLING_HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -733,34 +951,18 @@ const BILLING_HTML = `<!DOCTYPE html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>DSH 计费</title>
-<style>
-:root{--bg:#10141c;--card:#1a2030;--border:#2a3348;--text:#e6eaf2;--dim:#8b94a8;--accent:#4dabf7;--green:#38d9a9;--red:#ff6b6b}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text);padding:32px 20px;display:flex;justify-content:center}
-.wrap{width:100%;max-width:720px}
-h1{font-size:20px;margin-bottom:4px}
-.sub{color:var(--dim);font-size:12.5px;margin-bottom:20px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px 20px;margin-bottom:14px}
-.card h2{font-size:14px;color:var(--dim);font-weight:600;margin-bottom:10px;letter-spacing:.03em}
-.big{font-size:30px;font-weight:800;color:var(--green)}
-.big .cur{font-size:16px;font-weight:600;color:var(--dim);margin-left:4px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.item{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:10px 14px}
-.item label{display:block;font-size:11px;color:var(--dim);margin-bottom:4px}
-.item span{font-size:14px;word-break:break-all}
-.note{margin-top:12px;font-size:12px;color:var(--dim);line-height:1.7}
-.err{color:var(--red);font-size:13px;margin-top:8px}
-.actions{margin:18px 0;display:flex;gap:10px}
-button{font:inherit;font-size:13px;padding:9px 16px;border-radius:9px;border:1px solid var(--border);background:#232c40;color:var(--text);cursor:pointer}
-button:hover{border-color:var(--accent)}
-#time{color:var(--dim);font-size:12px;margin-left:auto;align-self:center}
+<style>${ZED_CSS}
+.big{font-size:30px;font-weight:700;color:var(--green);font-variant-numeric:tabular-nums}
+.big .cur{font-size:14px;font-weight:600;color:var(--faint);margin-left:4px}
+.note{margin-top:10px;font-size:11.5px;color:var(--faint);line-height:1.7}
+#time{color:var(--faint);font-size:11.5px;margin-left:auto;align-self:center}
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>DSH 计费</h1>
-  <div class="sub">DeepSeek 官方账户余额 · 全部会话 token 用量 · 估算花费（插件：dsh-desktop-tools）</div>
-  <div class="actions">
+  <div class="sub">DeepSeek 官方账户余额 · 全部会话 token 用量 · 估算花费</div>
+  <div class="row" style="margin-bottom:12px">
     <button id="refresh">刷新</button>
     <span id="time"></span>
   </div>
@@ -791,8 +993,7 @@ async function load(){
     const d=await (await fetch('/api/billing',{cache:'no-store'})).json();
     const b=d.balance;
     if(b&&!b.error){
-      $('balance').textContent='¥'+b.totalBalance.toFixed(2)+'<span class="cur">'+b.currency+'</span>';
-      $('balance').innerHTML=$('balance').textContent;
+      $('balance').textContent='¥'+b.totalBalance.toFixed(2)+' '+b.currency;
       $('balanceNote').textContent='充值 ¥'+b.toppedUpBalance.toFixed(2)+' · 赠送 ¥'+b.grantedBalance.toFixed(2)+(b.isAvailable?'':' · 账户不可用');
     }else{
       $('balance').textContent='无法获取';
@@ -829,39 +1030,12 @@ const PANEL_HTML = `<!DOCTYPE html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>DSH 环境面板</title>
-<style>
-:root{--bg:#10141c;--card:#1a2030;--border:#2a3348;--text:#e6eaf2;--dim:#8b94a8;--accent:#4dabf7;--green:#38d9a9;--red:#ff6b6b;--amber:#ffd43b}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text);padding:28px 18px;display:flex;justify-content:center}
-.wrap{width:100%;max-width:760px}
-h1{font-size:20px;margin-bottom:4px}
-.sub{color:var(--dim);font-size:12.5px;margin-bottom:18px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px 18px;margin-bottom:14px}
-.card h2{font-size:13px;color:var(--dim);font-weight:600;margin-bottom:10px;letter-spacing:.04em;display:flex;align-items:center;gap:8px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
-.item{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:10px 13px}
-.item label{display:block;font-size:11px;color:var(--dim);margin-bottom:4px}
-.item span{font-size:14px;word-break:break-all}
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-button{font:inherit;font-size:13px;padding:8px 14px;border-radius:9px;border:1px solid var(--border);background:#232c40;color:var(--text);cursor:pointer}
-button:hover{border-color:var(--accent)}
-button:disabled{opacity:.45;cursor:not-allowed}
-a{color:var(--accent);text-decoration:none}
-a:hover{text-decoration:underline}
-.badge{font-size:11px;padding:2px 8px;border-radius:20px;border:1px solid var(--border)}
-.badge.ok{color:var(--green);border-color:var(--green)}
-.badge.bad{color:var(--red);border-color:var(--red)}
-.badge.warn{color:var(--amber);border-color:var(--amber)}
-.badge.dim{color:var(--dim)}
-pre.log{background:#0b0e15;border:1px solid var(--border);border-radius:10px;padding:12px;font-size:12px;line-height:1.6;color:#9aa7c0;white-space:pre-wrap;word-break:break-all;max-height:220px;overflow:auto}
-.muted{color:var(--dim);font-size:12px}
-.err{color:var(--red);font-size:12.5px;margin-top:6px}
-</style>
+<style>${ZED_CSS}</style>
 </head>
 <body>
 <div class="wrap">
   <h1>DSH 环境面板</h1>
-  <div class="sub">插件 dsh-desktop-tools · 运行时管理 / Windows 补丁 / 计费摘要</div>
+  <div class="sub">插件 dsh-desktop-tools · 宿主状态 / 运行时管理 / 平台兼容 / 计费摘要</div>
 
   <div class="card">
     <h2>dsh 运行时</h2>
@@ -871,26 +1045,43 @@ pre.log{background:#0b0e15;border:1px solid var(--border);border-radius:10px;pad
       <div class="item"><label>状态</label><span id="state">-</span></div>
       <div class="item"><label>DSH_HOME</label><span id="dshHome">-</span></div>
     </div>
-    <div class="row" style="margin-top:12px">
+    <div class="row" style="margin-top:10px">
       <button id="btnUpdate">更新运行时</button>
       <button id="btnRefresh">刷新状态</button>
       <span class="muted" id="updateHint"></span>
     </div>
-    <div class="row" style="margin-top:8px">
-      <button id="btnDesktop">打开桌面端</button>
-      <span class="muted" id="desktopHint"></span>
-    </div>
-    <pre class="log" id="upLog" style="margin-top:10px;display:none"></pre>
+    <pre class="log" id="upLog" style="margin-top:8px;display:none"></pre>
     <div class="err" id="runtimeErr"></div>
   </div>
 
   <div class="card">
-    <h2>Windows 补丁 <span class="muted">（win32 运行时补丁）</span></h2>
-    <div id="patchList"></div>
-    <div class="row" style="margin-top:12px">
-      <button id="btnPatches">重新应用补丁</button>
-      <span class="muted" id="patchHint"></span>
+    <h2>桌面宿主</h2>
+    <div class="grid">
+      <div class="item"><label>状态</label><span id="hostState">-</span></div>
+      <div class="item"><label>二进制</label><span id="hostBin">-</span></div>
     </div>
+    <div class="row" style="margin-top:10px">
+      <button id="btnDesktop">打开桌面端</button>
+      <button id="btnEnsure">重新获取宿主</button>
+      <span class="muted" id="desktopHint"></span>
+    </div>
+    <div class="muted" style="margin-top:6px">代码编辑器：宿主菜单 / 托盘「打开代码编辑器」，或 <b>Ctrl+Shift+E</b>（主窗口内打开）</div>
+  </div>
+
+  <div class="card">
+    <h2>平台兼容（Windows）<span class="muted">自动适配，无需干预</span></h2>
+    <div class="row" style="margin-bottom:6px">
+      <span class="badge" id="compatBadge">-</span>
+      <span class="muted" id="compatHint"></span>
+    </div>
+    <details class="tech">
+      <summary>诊断详情</summary>
+      <div id="patchList" style="margin-top:8px"></div>
+      <div class="row" style="margin-top:8px">
+        <button id="btnPatches">重新应用</button>
+        <span class="muted" id="patchHint"></span>
+      </div>
+    </details>
   </div>
 
   <div class="card">
@@ -900,7 +1091,7 @@ pre.log{background:#0b0e15;border:1px solid var(--border);border-radius:10px;pad
       <div class="item"><label>估算已花费</label><span id="cost">-</span></div>
       <div class="item"><label>统计会话</label><span id="sessions">-</span></div>
     </div>
-    <div class="row" style="margin-top:12px">
+    <div class="row" style="margin-top:10px">
       <a href="/billing">打开完整计费页 →</a>
     </div>
   </div>
@@ -908,16 +1099,15 @@ pre.log{background:#0b0e15;border:1px solid var(--border);border-radius:10px;pad
   <div class="card">
     <h2>关于</h2>
     <div class="muted">
-      本面板由 dsh-desktop-tools 插件提供（纯 dsh 插件，无桌面壳依赖）。
-      外链（引用 / GitHub 等）会在浏览器新标签页中打开。
+      本面板由 dsh-desktop-tools 插件提供（纯 dsh 插件，无桌面壳依赖）。外链（引用 / GitHub 等）会在浏览器新标签页中打开。
     </div>
   </div>
 </div>
 <script>
 const $=(id)=>document.getElementById(id);
 const fmt=(n)=>(n??0).toLocaleString('zh-CN');
-const stateEl=(ok,text)=>{
-  const cls=ok?'ok':(text==='未知'||text==='未定位到 dsh 安装'||text==='-')?'dim':'bad';
+const badge=(ok,text)=>{
+  const cls=ok?'ok':(text==='未知'||text==='-'||text==='missing')?'dim':'bad';
   return '<span class="badge '+cls+'">'+text+'</span>';
 };
 async function loadRuntime(){
@@ -927,30 +1117,43 @@ async function loadRuntime(){
     $('latest').textContent=d.latest||'未知';
     $('dshHome').textContent=d.dshHome||'-';
     if(d.updateAvailable){
-      $('state').innerHTML=stateEl(false,'可更新');
-      $('updateHint').textContent='检测到新版本，可点击“更新运行时”（后台安装，完成后重启 dsh 服务生效）';
+      $('state').innerHTML=badge(false,'可更新');
+      $('updateHint').textContent='检测到新版本，可点击"更新运行时"（后台安装，完成后重启 dsh 服务生效）';
     }else if(d.installed&&d.latest){
-      $('state').innerHTML=stateEl(true,'已是最新');
+      $('state').innerHTML=badge(true,'已是最新');
       $('updateHint').textContent='';
     }else{
-      $('state').innerHTML=stateEl(false,'未知');
+      $('state').innerHTML=badge(false,'未知');
       $('updateHint').textContent='latest 获取失败（网络不可用？）或未定位到 dsh 安装：'+(d.runtimeDir||'未定位');
     }
-  }catch(e){
-    $('runtimeErr').textContent=''+e;
-  }
+  }catch(e){ $('runtimeErr').textContent=''+e; }
+}
+async function loadHost(){
+  try{
+    const d=await (await fetch('/api/desktop',{cache:'no-store'})).json();
+    const a=d.acquisition||{state:d.exists?'ready':'missing'};
+    if(a.state==='ready'){ $('hostState').innerHTML=badge(true,'已就绪'); }
+    else if(a.state==='running'){ $('hostState').innerHTML=badge(false,'获取中…'); }
+    else if(a.state==='failed'){ $('hostState').innerHTML=badge(false,'获取失败'); }
+    else { $('hostState').innerHTML=badge(false,'未获取'); }
+    $('hostBin').textContent=d.bin||'-';
+    $('desktopHint').textContent=d.hint||'';
+  }catch(e){ /* 忽略 */ }
 }
 async function loadPatches(){
   try{
     const d=await (await fetch('/api/patches',{cache:'no-store'})).json();
-    $('patchList').innerHTML=(d.patches||[]).map(p=>
-      '<div class="item" style="margin-bottom:8px">'+
-        '<div class="row" style="justify-content:space-between"><span>'+p.name+'</span>'+stateEl(p.ok,p.ok?'已应用':'未应用')+'</div>'+
-        '<div class="muted" style="margin-top:4px">'+p.detail+'</div>'+
-      '</div>').join('')||'<div class="muted">暂无补丁信息</div>';
-  }catch(e){
-    $('patchList').innerHTML='<div class="err">'+e+'</div>';
-  }
+    const list=d.patches||[];
+    const allOk=list.length>0&&list.every(p=>p.ok);
+    $('compatBadge').className='badge '+(allOk?'ok':'bad');
+    $('compatBadge').textContent=allOk?'已就绪':'需手动处理';
+    $('compatHint').textContent=allOk?'Windows 下自动适配终端/进程与命令工具，非 Windows 平台自动跳过。':'部分适配未生效，可在下方"重新应用"或查看诊断。';
+    $('patchList').innerHTML=list.map(p=>
+      '<div class="item" style="margin-bottom:6px">'+
+        '<div class="row" style="justify-content:space-between"><span>'+p.name+'</span>'+badge(p.ok,p.ok?'已适配':'未适配')+'</div>'+
+        '<div class="muted" style="margin-top:2px">'+p.detail+'</div>'+
+      '</div>').join('')||'<div class="muted">暂无信息</div>';
+  }catch(e){ $('patchList').innerHTML='<div class="err">'+e+'</div>'; }
 }
 async function loadBilling(){
   try{
@@ -961,17 +1164,7 @@ async function loadBilling(){
     $('sessions').textContent=(d.usage&&!d.usage.error)?fmt(d.usage.sessions):'-';
   }catch(e){ /* 忽略 */ }
 }
-async function loadDesktop(){
-  try{
-    const d=await (await fetch('/api/desktop',{cache:'no-store'})).json();
-    $('desktopHint').textContent=d.exists
-      ? ('宿主就绪'+(d.serverUp?' · dsh 服务在线':''))
-      : (d.hint||'');
-  }catch(e){ /* 忽略 */ }
-}
-async function refresh(){
-  await Promise.all([loadRuntime(),loadPatches(),loadBilling(),loadDesktop()]);
-}
+async function refresh(){ await Promise.all([loadRuntime(),loadHost(),loadPatches(),loadBilling()]); }
 $('btnRefresh').addEventListener('click',refresh);
 $('btnDesktop').addEventListener('click',async()=>{
   $('btnDesktop').disabled=true;
@@ -982,6 +1175,16 @@ $('btnDesktop').addEventListener('click',async()=>{
     else{ $('desktopHint').textContent='启动失败：'+(d.error||''); }
   }catch(e){ $('desktopHint').textContent='请求失败：'+e; }
   $('btnDesktop').disabled=false;
+});
+$('btnEnsure').addEventListener('click',async()=>{
+  $('btnEnsure').disabled=true;
+  $('desktopHint').textContent='正在后台获取宿主…';
+  try{
+    const d=await (await fetch('/api/host/ensure',{method:'POST'})).json();
+    $('desktopHint').textContent=(d.state==='running')?'已开始获取（Release 下载或源码构建），稍后刷新查看状态':(d.error||d.state);
+  }catch(e){ $('desktopHint').textContent='请求失败：'+e; }
+  $('btnEnsure').disabled=false;
+  setTimeout(loadHost,3000);
 });
 $('btnUpdate').addEventListener('click',async()=>{
   $('btnUpdate').disabled=true;
@@ -1011,16 +1214,209 @@ $('btnPatches').addEventListener('click',async()=>{
   $('btnPatches').disabled=true;
   $('patchHint').textContent='正在应用…';
   try{
-    const d=await (await fetch('/api/patches',{method:'POST'})).json();
+    await (await fetch('/api/patches',{method:'POST'})).json();
     $('patchHint').textContent='已应用，重启服务后生效';
     await loadPatches();
-  }catch(e){
-    $('patchHint').textContent='失败：'+e;
-  }
+  }catch(e){ $('patchHint').textContent='失败：'+e; }
   $('btnPatches').disabled=false;
 });
 refresh();
 setInterval(loadRuntime,30000);
+</script>
+</body>
+</html>`;
+
+const EDITOR_HTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DSH 代码编辑器</title>
+<style>${ZED_CSS}
+body{margin:0;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+#toolbar{display:flex;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid var(--border);background:var(--raise);flex:none}
+#toolbar .root{font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40vw}
+#toolbar .spacer{flex:1}
+#status{font-size:11.5px;color:var(--faint)}
+#main{flex:1;display:flex;min-height:0}
+#tree{width:250px;flex:none;overflow:auto;border-right:1px solid var(--border);background:var(--bg);padding:6px 0;font-size:12.5px}
+#tree .node{padding:3px 10px;cursor:pointer;display:flex;gap:6px;align-items:center;white-space:nowrap;user-select:none}
+#tree .node:hover{background:var(--hover)}
+#tree .node.dir .caret{display:inline-block;width:10px;color:var(--faint)}
+#tree .node.dir.open .caret{transform:rotate(90deg)}
+#tree .node.active{background:#1b1e2a}
+#tree .node .nm{overflow:hidden;text-overflow:ellipsis}
+#tree .node.dir>.nm{color:var(--text)}
+#tree .children{padding-left:14px}
+#editorPane{flex:1;min-width:0;display:flex;flex-direction:column}
+#editorHost{flex:1;min-height:0}
+#editorHost .fallback{width:100%;height:100%;background:#0a0b0b;color:var(--text);border:none;padding:12px;font:12.5px/1.6 Consolas,"Cascadia Mono",monospace;resize:none;outline:none}
+#empty{display:flex;align-items:center;justify-content:center;height:100%;color:var(--faint);font-size:12.5px}
+button{font:inherit;font-size:12px;padding:5px 10px;border-radius:5px;border:1px solid var(--border);background:var(--hover);color:var(--text);cursor:pointer}
+button:hover{border-color:var(--accent)}
+#err{color:var(--red);font-size:12px;padding:4px 14px;background:var(--raise);border-top:1px solid var(--border);display:none}
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <button id="back">← 返回主界面</button>
+  <span class="root" id="rootLabel">/</span>
+  <span class="spacer"></span>
+  <button id="refreshTree">刷新</button>
+  <span id="status"></span>
+</div>
+<div id="main">
+  <div id="tree"></div>
+  <div id="editorPane">
+    <div id="editorHost"><div id="empty">从左侧选择一个文件，或 Ctrl+S 保存修改</div></div>
+  </div>
+</div>
+<div id="err"></div>
+<script>
+const $=(id)=>document.getElementById(id);
+let current=null;
+let monacoReady=false;
+let editor=null;
+let fallback=null;
+
+const LANG={
+  js:'javascript',mjs:'javascript',cjs:'javascript',jsx:'javascript',ts:'typescript',tsx:'typescript',
+  json:'json',jsonc:'json',md:'markdown',html:'html',htm:'html',css:'css',scss:'scss',less:'less',
+  py:'python',rs:'rust',go:'go',java:'java',c:'c',h:'c',cpp:'cpp',hpp:'cpp',cs:'csharp',
+  yml:'yaml',yaml:'yaml',toml:'ini',ini:'ini',sh:'shell',bash:'shell',ps1:'powershell',
+  sql:'sql',xml:'xml',vue:'html',svelte:'html',txt:'plaintext',log:'plaintext'
+};
+const langOf=(name)=>{const i=name.lastIndexOf('.');if(i<0)return 'plaintext';return LANG[name.slice(i+1).toLowerCase()]||'plaintext';};
+
+function setStatus(t){$('status').textContent=t;}
+function showErr(t){const e=$('err');e.textContent=t;e.style.display=t?'block':'none';}
+
+/* ---------- Monaco（CDN 按需加载，失败降级 textarea） ---------- */
+function loadMonaco(){
+  return new Promise((resolve)=>{
+    if(window.monaco){resolve(true);return;}
+    const timeout=setTimeout(()=>{resolve(false);},6000);
+    const link=document.createElement('link');
+    link.rel='stylesheet';
+    link.href='https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs/editor/editor.main.min.css';
+    document.head.appendChild(link);
+    const s=document.createElement('script');
+    s.src='https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs/loader.js';
+    s.onload=()=>{
+      require.config({paths:{vs:'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs'}});
+      require(['vs/editor/editor.main'],()=>{clearTimeout(timeout);resolve(true);});
+    };
+    s.onerror=()=>{clearTimeout(timeout);resolve(false);};
+    document.head.appendChild(s);
+  });
+}
+
+/* ---------- 文件树 ---------- */
+async function loadDir(dir, container, level){
+  let data;
+  try{
+    const r=await fetch('/api/fs/tree?dir='+encodeURIComponent(dir),{cache:'no-store'});
+    data=await r.json();
+  }catch(e){showErr('加载目录失败：'+e);return;}
+  if(data.error){showErr(data.error);return;}
+  container.innerHTML='';
+  for(const it of data.entries){
+    const row=document.createElement('div');
+    row.className='node'+(it.dir?' dir':'');
+    if(it.dir){
+      row.innerHTML='<span class="caret">▸</span><span class="nm">'+esc(it.name)+'</span>';
+      const child=document.createElement('div');
+      child.className='children';
+      child.style.display='none';
+      row.addEventListener('click',(e)=>{
+        e.stopPropagation();
+        const open=child.style.display!=='none';
+        child.style.display=open?'none':'block';
+        row.classList.toggle('open',!open);
+        if(!open&&!child.dataset.loaded){child.dataset.loaded='1';loadDir(it.path,child,level+1);}
+      });
+      container.appendChild(row);
+      container.appendChild(child);
+    }else{
+      row.innerHTML='<span class="nm">'+esc(it.name)+'</span>';
+      row.title=it.name+'  ·  '+(it.size/1024).toFixed(1)+' KB';
+      row.addEventListener('click',()=>openFile(it.path));
+      container.appendChild(row);
+    }
+  }
+}
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+/* ---------- 打开 / 保存 ---------- */
+async function openFile(path){
+  showErr('');
+  let data;
+  try{
+    const r=await fetch('/api/fs/read?path='+encodeURIComponent(path),{cache:'no-store'});
+    data=await r.json();
+  }catch(e){showErr('读取失败：'+e);return;}
+  if(data.error){showErr(data.error);return;}
+  current=path;
+  setStatus('编辑：'+path);
+  document.querySelectorAll('#tree .node.active').forEach(n=>n.classList.remove('active'));
+  const host=$('editorHost');
+  if(monacoReady&&editor){
+    editor.setModel(monaco.editor.createModel(data.content,langOf(path)));
+    editor.focus();
+  }else{
+    if(!fallback){
+      fallback=document.createElement('textarea');
+      fallback.className='fallback';
+      host.appendChild(fallback);
+    }
+    fallback.value=data.content;
+    fallback.focus();
+  }
+}
+async function saveFile(){
+  if(!current)return;
+  const content=monacoReady&&editor?editor.getValue():(fallback?fallback.value:'');
+  setStatus('保存中…');
+  try{
+    const r=await fetch('/api/fs/write',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({path:current,content})});
+    const d=await r.json();
+    if(d.error){showErr(d.error);setStatus('保存失败');}
+    else{setStatus('已保存 '+current);setTimeout(()=>setStatus(''),1500);}
+  }catch(e){showErr('保存失败：'+e);setStatus('');}
+}
+
+/* ---------- 初始化 ---------- */
+(async()=>{
+  $('back').addEventListener('click',()=>{location.href='/';});
+  $('refreshTree').addEventListener('click',()=>loadDir('',$('tree'),0));
+  document.addEventListener('keydown',(e)=>{
+    if((e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();saveFile();}
+    if((e.ctrlKey||e.metaKey)&&e.key==='b'){e.preventDefault();location.href='/';}
+  });
+  const root=await (await fetch('/api/fs/tree?dir=.',{cache:'no-store'})).json();
+  if(root.error){showErr(root.error);}
+  else{
+    $('rootLabel').textContent=root.root;
+    loadDir(root.root,$('tree'),0);
+  }
+  const ok=await loadMonaco();
+  if(ok){
+    monacoReady=true;
+    require(['vs/editor/editor.main'],()=>{
+      editor=monaco.editor.create($('editorHost'),{
+        theme:'vs-dark',
+        automaticLayout:true,
+        fontSize:13,
+        minimap:{enabled:false},
+        scrollBeyondLastLine:false,
+        renderWhitespace:'none'
+      });
+      monaco.editor.setTheme('vs-dark');
+    });
+  }else{
+    setStatus('Monaco 加载失败（离线？），已使用内置编辑器');
+  }
+})();
 </script>
 </body>
 </html>`;
@@ -1043,21 +1439,59 @@ function html(res, body) {
   res.end(body);
 }
 
+function readBody(req, maxBytes = 16 * 1024 * 1024): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > maxBytes) {
+        reject(new Error("请求体过大"));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+function qs(req) {
+  try {
+    return new URL(req.url ?? "/", "http://x").searchParams;
+  } catch {
+    return new URLSearchParams();
+  }
+}
+
 function apply(ctx, config) {
   const prices = { input: 1.5, cacheRead: 0.05, cacheWrite: 0, output: 4.5, ...(config.prices ?? {}) };
   updateMode = config.updateMode ?? "auto";
   desktopBin = config.desktopBin ?? "";
+  editorRoot = resolve(config.editorRoot || process.cwd());
   currentPort = ctx.webServer?.port ?? Number(process.env.DSH_DESKTOP_PORT || 3080);
 
-  // 加载即重打补丁（幂等）：minimal 模式 / terminal inspection 在 win32 的缺口
+  // 加载即重打平台兼容补丁（幂等）：Windows 下自动适配终端/进程与命令工具
   if (config.autoApplyPatches) {
     try {
       for (const p of applyPatches()) {
-        console.log(`[desktop-tools] patch ${p.id}: ${p.ok ? "ok" : "failed"} — ${p.detail}`);
+        console.log(`[desktop-tools] platform-compat ${p.id}: ${p.ok ? "ok" : "failed"} — ${p.detail}`);
       }
     } catch (e) {
-      console.warn(`[desktop-tools] 加载时应用补丁失败：${e.message}`);
+      console.warn(`[desktop-tools] 加载时应用平台兼容补丁失败：${e.message}`);
     }
+  }
+  // 惰性兜底：确保宿主二进制可用（安装时的 postinstall 通常已执行）
+  if (config.hostAutoInstall !== false) {
+    setTimeout(() => {
+      const r = spawnHostEnsure();
+      if (r.state === "running") {
+        console.log("[desktop-tools] 正在后台获取宿主二进制…");
+      } else if (r.state === "failed") {
+        console.warn(`[desktop-tools] 宿主自动获取未启动：${r.error}`);
+      }
+    }, 600);
   }
   // 预热 npm view 缓存（异步，不阻塞事件循环）
   fetchLatestVersionAsync();
@@ -1068,14 +1502,14 @@ function apply(ctx, config) {
       const latest = latestVersion();
       if (installed && latest && isNewer(latest, installed)) {
         console.log(
-          `[desktop-tools] 检测到 dsh 新版本 ${latest}（当前 ${installed}），可在 /panel 面板点击“更新运行时”升级`,
+          `[desktop-tools] 检测到 dsh 新版本 ${latest}（当前 ${installed}），可在 /panel 面板点击"更新运行时"升级`,
         );
       }
     }, 1500);
   }
 
   // 桌面端：解析 `dsh web --desktop` / `dsh web --no-desktop` 覆盖 autoOpenDesktop，
-  // 服务就绪后自动打开桌面窗口（宿主二进制随插件分发或仓库构建）。
+  // 服务就绪后自动打开桌面窗口（宿主由插件自动获取）。
   const cmdline = ctx.cmdlineArgs?.get?.() ?? [];
   let wantDesktop = config.autoOpenDesktop !== false;
   if (cmdline.includes("--no-desktop")) wantDesktop = false;
@@ -1085,8 +1519,11 @@ function apply(ctx, config) {
     setTimeout(() => {
       const bin = desktopHostPath();
       if (!bin || !existsSync(bin)) {
+        const st = hostStatus();
         console.log(
-          "[desktop-tools] 已请求打开桌面端，但未找到宿主二进制（dsh-desktop.exe）——请重新安装插件或 cargo build",
+          st.state === "running"
+            ? "[desktop-tools] 已请求打开桌面端，宿主正在后台获取中（稍后可在 /panel 手动打开）"
+            : "[desktop-tools] 已请求打开桌面端，但未找到宿主二进制——请重新安装插件或设置 DSH_DESKTOP_BIN",
         );
         return;
       }
@@ -1125,6 +1562,16 @@ function apply(ctx, config) {
         handler: async (_req, res) => html(res, BILLING_HTML),
       }),
     "desktop-tools: billing page",
+  );
+
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: "exact",
+        path: "/editor",
+        handler: async (_req, res) => html(res, EDITOR_HTML),
+      }),
+    "desktop-tools: editor page",
   );
 
   ctx.effect(
@@ -1175,6 +1622,18 @@ function apply(ctx, config) {
     () =>
       ctx.webServer.register({
         kind: "exact",
+        path: "/api/host/ensure",
+        handler: async (_req, res) => {
+          json(res, spawnHostEnsure());
+        },
+      }),
+    "desktop-tools: host ensure api",
+  );
+
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: "exact",
         path: "/api/patches",
         handler: async (req, res) => {
           const patches = req.method === "POST" ? applyPatches() : patchesStatus();
@@ -1193,6 +1652,52 @@ function apply(ctx, config) {
           billingPayload(prices, (payload) => json(res, payload)),
       }),
     "desktop-tools: billing api",
+  );
+
+  // 代码编辑器文件 API（路径严格限制在工作区根目录内）
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: "exact",
+        path: "/api/fs/tree",
+        handler: async (req, res) => {
+          const dir = qs(req).get("dir") || ".";
+          json(res, fsTree(dir));
+        },
+      }),
+    "desktop-tools: fs tree api",
+  );
+
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: "exact",
+        path: "/api/fs/read",
+        handler: async (req, res) => {
+          const p = qs(req).get("path") || "";
+          json(res, fsRead(p));
+        },
+      }),
+    "desktop-tools: fs read api",
+  );
+
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: "exact",
+        path: "/api/fs/write",
+        handler: async (req, res) => {
+          if (req.method !== "POST") return json(res, { error: "需要 POST" }, 405);
+          let body;
+          try {
+            body = JSON.parse(await readBody(req));
+          } catch (e) {
+            return json(res, { error: `请求体解析失败：${e.message}` }, 400);
+          }
+          json(res, fsWrite(String(body.path ?? ""), String(body.content ?? "")));
+        },
+      }),
+    "desktop-tools: fs write api",
   );
 }
 

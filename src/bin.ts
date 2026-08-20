@@ -6,22 +6,37 @@
 //
 // 宿主定位顺序：
 //   1) 环境变量 DSH_DESKTOP_BIN
-//   2) 仓库内构建产物：<dsh-env>/host/target/release/dsh-desktop(.exe)
-//   3) PATH 中的 dsh-desktop
-// 宿主源码独立仓库：https://github.com/YUEEEEY/dsh-desktop-host（按系统 cargo build 后设置 DSH_DESKTOP_BIN）
+//   2) 插件自动获取缓存目录：<DSH_HOME>/desktop-host/<platform>-<arch>/
+//   3) 仓库内构建产物：<dsh-env>/host/target/release/dsh-desktop(.exe)
+//   4) PATH 中的 dsh-desktop
+// 宿主源码独立仓库：https://github.com/YUEEEEY/dsh-desktop-host（安装插件时自动下载/构建）
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 import { createConnection } from "node:net";
 import { spawn } from "node:child_process";
 
 const isWin = process.platform === "win32";
 const exeName = isWin ? "dsh-desktop.exe" : "dsh-desktop";
 
+function hostPlatformDir(): string {
+  const p = process.platform;
+  const a = process.arch;
+  if (p === "win32") return "win32-x64";
+  if (p === "darwin") return a === "arm64" ? "darwin-arm64" : "darwin-x64";
+  if (p === "linux") return a === "arm64" ? "linux-arm64" : "linux-x64";
+  return `${p}-${a}`;
+}
+
 function locateHost(): string {
   if (process.env.DSH_DESKTOP_BIN && existsSync(process.env.DSH_DESKTOP_BIN)) {
     return process.env.DSH_DESKTOP_BIN;
   }
+  // 自动获取缓存目录：<DSH_HOME>/desktop-host/<platform>-<arch>/
+  const home = process.env.DSH_HOME || join(homedir(), ".dsh");
+  const cached = join(home, "desktop-host", hostPlatformDir(), exeName);
+  if (existsSync(cached)) return cached;
   // 仓库内构建：plugins/dsh-desktop-tools/lib/bin.js → ../../host/target/release/
   const here = dirname(fileURLToPath(import.meta.url));
   const dev = join(here, "..", "..", "..", "host", "target", "release", exeName);
