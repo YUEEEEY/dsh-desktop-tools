@@ -1,18 +1,17 @@
 {
   "name": "dsh-desktop-tools",
-  "version": "0.2.0",
+  "version": "0.3.1",
   "description": "dsh 环境管理插件（TypeScript）：桌面窗口宿主（Rust/Tauri）管理、运行时版本管理与更新、Windows 补丁（win32 进程检查器 / minimal preset pwsh）、DeepSeek 计费与综合面板（/panel、/billing、/api/runtime、/api/patches、/api/desktop）。",
   "type": "module",
   "main": "lib/index.js",
   "bin": {
-    "dsh-desktop": "bin/dsh-desktop.js"
+    "dsh-desktop": "lib/bin.js"
   },
   "exports": {
     ".": "./lib/index.js"
   },
   "files": [
     "lib",
-    "bin",
     "cordis.patch.yml"
   ],
   "scripts": {
