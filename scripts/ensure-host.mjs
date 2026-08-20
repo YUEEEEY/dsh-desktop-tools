@@ -12,14 +12,15 @@
 //   node scripts/ensure-host.mjs --status   # 仅输出当前状态 JSON
 //
 // 状态文件：$DSH_HOME/desktop-host/ensure-status.json（供面板 /api/desktop 读取）
-import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 
 const HOST_REPO = "YUEEEEY/dsh-desktop-host";
-const GITHUB_API = "https://api.github.com";
-const REPO_URL = `https://github.com/${HOST_REPO}.git`;
+// API 基址可用环境变量覆盖（本地模拟测试 / 自建镜像用）
+const GITHUB_API = process.env.DSH_HOST_GITHUB_API || "https://api.github.com";
+const REPO_URL = process.env.DSH_HOST_REPO_URL || `https://github.com/${HOST_REPO}.git`;
 const UA = "dsh-desktop-tools (host auto-install)";
 
 function target() {
@@ -161,7 +162,7 @@ function status() {
       process.stdout.write(JSON.stringify({ state: bin ? "ready" : "missing", path: bin }));
       return;
     }
-    process.stdout.write(require("node:fs").readFileSync(p, "utf8"));
+    process.stdout.write(readFileSync(p, "utf8"));
   } catch {
     process.stdout.write(JSON.stringify({ state: "unknown" }));
   }
