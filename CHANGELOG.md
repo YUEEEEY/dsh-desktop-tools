@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.0 — 2026-08-20
+
+- Code-review loop in the code view (Codex/Qoder/WorkBuddy-style):
+  - **Disk change detection**: the editor watches the workspace and shows a
+    "↻" badge on tabs whose files changed on disk (e.g. after the agent edits
+    them); non-dirty tabs reload automatically, deleted files are flagged "✕".
+    The file tree refreshes automatically and keeps expanded folders.
+  - **🤖 审查此文件**: one click copies a review prompt for the current file
+    and focuses the conversation sidebar, ready to paste and send.
+  - **切换目录**: switch the workspace root at runtime (same-origin guarded),
+    e.g. open another project without restarting.
+  - Change-tracking scans run only while the editor is open (idle timeout),
+    skipping `.git`/`node_modules` etc.; mutating fs endpoints are
+    same-origin-checked.
+
 ## 0.4.1 — 2026-08-20
 
 - Code editor UX overhaul (Qoder/WorkBuddy-style): conversation view ↔ code view

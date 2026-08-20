@@ -69,10 +69,13 @@ Host lookup order: `desktopBin` config → `DSH_DESKTOP_BIN` env → auto-fetch 
 Code view layout:
 
 - **Conversation sidebar on the left**: embeds the live session (draggable width, collapsible) — chat stays visible while editing;
-- **File tree**: workspace browsing (`.git` / `node_modules` etc. skipped, lazy expansion);
+- **File tree**: workspace browsing (`.git` / `node_modules` etc. skipped, lazy expansion, auto-refresh that keeps folders expanded);
 - **Multi-tab editor**: language detected by extension, `Ctrl+S` saves, unsaved markers, status bar (path/language/line-col);
+- **🤖 Review this file**: one click copies a review prompt for the current file and focuses the conversation sidebar — paste and let the agent review;
+- **Disk change detection**: when the agent (or anything else) modifies files, tabs show a "↻" badge (unmodified files reload automatically, deleted files get "✕"), and the tree refreshes — converse and review the agent's edits in place;
+- **Switch directory**: change the workspace root at runtime (open another project without restarting);
 - Monaco-based editor (npmmirror CDN first, jsdelivr fallback, built-in editor when offline);
-- the file API (`/api/fs/tree|read|write`) is strictly confined to the workspace root and loopback-only;
+- the file API (`/api/fs/tree|read|write|watch|changes|root`) is strictly confined to the workspace root, loopback-only, and mutating endpoints are same-origin checked;
 - default root is the dsh workspace; override with the `editorRoot` config.
 
 ## Routes

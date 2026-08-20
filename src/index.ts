@@ -914,6 +914,90 @@ function fsWrite(p, content) {
   }
 }
 
+/* ---------------- 代码编辑器：磁盘变更感知 ---------------- */
+
+/**
+ * 扫描工作区文件（跳过 .git/node_modules 等、限深 8 层、上限 3 万条目），
+ * 与上次快照比对产出变更事件。仅当编辑器页面打开时（/api/fs/watch 激活）
+ * 每 4 秒扫描一次，空闲 2 分钟自动停止。
+ */
+let watchTimer: ReturnType<typeof setInterval> | null = null;
+let watchActiveUntil = 0;
+let fsCache = new Map<string, string>();
+let changeEvents: { path: string; kind: "add" | "change" | "delete"; at: number }[] = [];
+
+const WATCH_SKIP = new Set([
+  ".git", "node_modules", ".dsh", ".cache", "target", "dist", ".pnpm",
+  ".ignored_dsh-model-router", ".vscode", ".idea",
+]);
+
+function touchFsWatcher() {
+  watchActiveUntil = Date.now() + 120000;
+  if (!watchTimer) watchTimer = setInterval(scanFsForChanges, 4000);
+}
+
+function scanFsForChanges() {
+  if (Date.now() > watchActiveUntil) {
+    if (watchTimer) {
+      clearInterval(watchTimer);
+      watchTimer = null;
+    }
+    fsCache.clear();
+    return;
+  }
+  const next = new Map<string, string>();
+  const walk = (dir: string, depth: number) => {
+    if (depth > 8 || next.size >= 30000) return;
+    let names: string[] = [];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const n of names) {
+      if (WATCH_SKIP.has(n)) continue;
+      if (n.startsWith(".") && n !== ".env" && n !== ".env.local") continue;
+      const full = join(dir, n);
+      let st;
+      try {
+        st = statSync(full);
+      } catch {
+        continue;
+      }
+      const rel = full.slice(editorRoot.length).replace(/\\/g, "/").replace(/^\//, "");
+      if (st.isDirectory()) {
+        walk(full, depth + 1);
+      } else if (st.isFile() && next.size < 30000) {
+        next.set(rel, `${st.mtimeMs}:${st.size}`);
+      }
+    }
+  };
+  walk(editorRoot, 0);
+  const now = Date.now();
+  for (const [rel, sig] of next) {
+    const old = fsCache.get(rel);
+    if (old === undefined) changeEvents.push({ path: rel, kind: "add", at: now });
+    else if (old !== sig) changeEvents.push({ path: rel, kind: "change", at: now });
+  }
+  for (const rel of fsCache.keys()) {
+    if (!next.has(rel)) changeEvents.push({ path: rel, kind: "delete", at: now });
+  }
+  if (changeEvents.length > 1000) changeEvents.splice(0, changeEvents.length - 1000);
+  fsCache = next;
+}
+
+/** 变更类接口的同源校验：Origin 必须与 Host 一致（防本地跨源滥用） */
+function sameOrigin(req): boolean {
+  const origin = req.headers?.origin;
+  const host = req.headers?.host;
+  if (origin === undefined || host === undefined) return false;
+  try {
+    return new URL(origin).host === host;
+  } catch {
+    return false;
+  }
+}
+
 /* ---------------- 页面（Zed 风格） ---------------- */
 
 const ZED_CSS = `:root{--bg:#0d0f0f;--raise:#141617;--hover:#191c1c;--border:#232626;--text:#d8dcda;--dim:#7d8580;--faint:#5a615d;--accent:#4d6bfe;--green:#3fb68b;--amber:#d19a3d;--red:#e5534b}
@@ -1268,6 +1352,9 @@ body{display:flex;flex-direction:column}
 .tab .dot{width:7px;height:7px;border-radius:50%;background:var(--amber);flex:none}
 .tab .x{margin-left:2px;color:var(--faint);font-size:11px;padding:0 3px;border-radius:3px}
 .tab .x:hover{background:var(--hover);color:var(--text)}
+.tab .reload{margin-left:2px;color:var(--amber);font-size:11px;padding:0 3px;border-radius:3px;cursor:pointer}
+.tab .reload:hover{background:var(--hover);color:var(--text)}
+#toast{position:fixed;left:50%;bottom:36px;transform:translateX(-50%);background:#16181c;border:1px solid var(--border);color:var(--text);padding:8px 16px;border-radius:8px;font-size:12px;z-index:100000;display:none;box-shadow:0 6px 24px rgba(0,0,0,.45);max-width:70vw;text-align:center}
 #editorHost{flex:1;min-height:0;position:relative}
 #editorHost .fallback{position:absolute;inset:0;width:100%;height:100%;background:#0a0b0b;color:var(--text);border:none;padding:12px;font:13px/1.6 Consolas,"Cascadia Mono",monospace;resize:none;outline:none}
 #empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--faint);font-size:12.5px}
@@ -1285,6 +1372,7 @@ body{display:flex;flex-direction:column}
   </div>
   <span class="root" id="rootLabel">/</span>
   <span class="spacer"></span>
+  <button id="switchRoot" title="切换工作区目录（打开其它项目）">切换目录</button>
   <button id="refreshTree">刷新文件</button>
   <span id="status"></span>
 </div>
@@ -1306,11 +1394,13 @@ body{display:flex;flex-direction:column}
       <span class="sb" id="sbLang"></span>
       <span class="sb" id="sbPos"></span>
       <span class="grow"></span>
+      <button id="askReview" title="让 AI 审查当前文件：复制审查指令到对话并聚焦对话侧栏" style="padding:2px 8px;font-size:11px">🤖 审查此文件</button>
       <span class="sb" id="sbSave"></span>
     </div>
   </div>
 </div>
 <div id="err"></div>
+<div id="toast"></div>
 <script>
 (function () {
   'use strict';
@@ -1322,6 +1412,12 @@ body{display:flex;flex-direction:column}
   var fallback = null;
   var contents = {};      // path -> 内容（文本/脏标记基准）
   var models = {};        // path -> monaco model
+  var currentRoot = '';   // 当前工作区根目录（绝对路径）
+  var expandedDirs = {};  // 已展开的目录（变更后恢复展开状态）
+  var watchNext = 0;      // 变更事件游标
+  var suppressDirty = false; // 重新加载时抑制脏标记
+  var treeRefreshPending = false;
+  var toastTimer = null;
 
   var CDNS = [
     { css: 'https://registry.npmmirror.com/monaco-editor/0.52.0/files/min/vs/editor/editor.main.min.css', js: 'https://registry.npmmirror.com/monaco-editor/0.52.0/files/min/vs/loader.js', vs: 'https://registry.npmmirror.com/monaco-editor/0.52.0/files/min/vs' },
@@ -1333,6 +1429,26 @@ body{display:flex;flex-direction:column}
   function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
   function setStatus(t) { $('status').textContent = t || ''; }
   function showErr(t) { var e = $('err'); e.textContent = t || ''; e.style.display = t ? 'block' : 'none'; }
+  function toast(msg) {
+    var t = $('toast');
+    t.textContent = msg;
+    t.style.display = 'block';
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { t.style.display = 'none'; }, 2600);
+  }
+  function relOf(abs) {
+    if (!currentRoot) return abs;
+    if (abs.indexOf(currentRoot) === 0) return abs.slice(currentRoot.length).replace(/\\/g, '/').replace(/^\//, '');
+    return abs;
+  }
+  function scheduleTreeRefresh() {
+    if (treeRefreshPending) return;
+    treeRefreshPending = true;
+    setTimeout(function () {
+      treeRefreshPending = false;
+      if (!$('treePane').classList.contains('hidden')) refreshTree();
+    }, 600);
+  }
 
   /* ---------- Monaco 按需加载：npmmirror → jsdelivr → 内置编辑器 ---------- */
   function loadMonaco() {
@@ -1395,8 +1511,15 @@ body{display:flex;flex-direction:column}
                 var open = c.style.display !== 'none';
                 c.style.display = open ? 'none' : 'block';
                 r.classList.toggle('open', !open);
+                if (open) delete expandedDirs[path]; else expandedDirs[path] = 1;
                 if (!open && !c.getAttribute('data-loaded')) { c.setAttribute('data-loaded', '1'); loadDir(path, c); }
               });
+              if (expandedDirs[path]) {
+                c.style.display = 'block';
+                r.classList.add('open');
+                c.setAttribute('data-loaded', '1');
+                loadDir(path, c);
+              }
             })(it.path, row, child);
             container.appendChild(row);
             container.appendChild(child);
@@ -1428,7 +1551,7 @@ body{display:flex;flex-direction:column}
       .then(function (data) {
         if (data.error) { showErr(data.error); return; }
         if (!tabs.some(function (t) { return t.path === path; })) {
-          tabs.push({ path: path, name: baseOf(path), dirty: false });
+          tabs.push({ path: path, name: baseOf(path), dirty: false, diskChanged: false, deleted: false });
         }
         contents[path] = data.content;
         activePath = path;
@@ -1446,7 +1569,7 @@ body{display:flex;flex-direction:column}
       if (fallback) { fallback.remove(); fallback = null; }
       if (!models[path]) {
         models[path] = monaco.editor.createModel(contents[path] || '', langOf(path));
-        models[path].onDidChangeModelContent(function () { setTabDirty(path, true); });
+        models[path].onDidChangeModelContent(function () { if (!suppressDirty) setTabDirty(path, true); });
       }
       editor.setModel(models[path]);
       editor.focus();
@@ -1460,6 +1583,40 @@ body{display:flex;flex-direction:column}
       fallback.focus();
     }
     updateStatusbar();
+  }
+  /** 从磁盘重新加载文件（保留未保存修改时先确认） */
+  function reloadFile(path, force) {
+    var t = tabs.find(function (x) { return x.path === path; });
+    if (!t) return;
+    if (!force && t.dirty && !confirm('文件「' + t.name + '」有未保存的修改，重新加载将丢失这些修改，确定？')) return;
+    fetch('/api/fs/read?path=' + encodeURIComponent(path), { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.error) {
+          if (data.error.indexOf('目录') === 0) return; // 目录类错误忽略
+          t.deleted = true;
+          t.diskChanged = false;
+          renderTabs();
+          updateStatusbar();
+          showErr('文件不可读：' + data.error);
+          return;
+        }
+        contents[path] = data.content;
+        t.deleted = false;
+        t.diskChanged = false;
+        t.dirty = false;
+        if (monacoReady && editor && models[path]) {
+          suppressDirty = true;
+          models[path].setValue(data.content);
+          suppressDirty = false;
+          if (activePath === path) { editor.setModel(models[path]); editor.focus(); }
+        } else if (activePath === path && fallback) {
+          fallback.value = data.content;
+        }
+        renderTabs();
+        updateStatusbar();
+      })
+      .catch(function (e) { showErr('重新加载失败：' + e); });
   }
   function saveFile() {
     if (!activePath) { setStatus('请先打开一个文件'); return; }
@@ -1479,10 +1636,10 @@ body{display:flex;flex-direction:column}
       })
       .catch(function (e) { showErr('保存失败：' + e); setStatus(''); });
   }
-  function closeTab(path) {
+  function closeTab(path, force) {
     var idx = tabs.findIndex(function (t) { return t.path === path; });
     if (idx < 0) return;
-    if (tabs[idx].dirty && !confirm('文件「' + tabs[idx].name + '」未保存，确定关闭？')) return;
+    if (!force && tabs[idx].dirty && !confirm('文件「' + tabs[idx].name + '」未保存，确定关闭？')) return;
     tabs.splice(idx, 1);
     delete contents[path];
     if (models[path]) { models[path].dispose(); delete models[path]; }
@@ -1531,6 +1688,25 @@ body{display:flex;flex-direction:column}
         dot.title = '未保存';
         tab.appendChild(dot);
       }
+      if (t.deleted) {
+        var del = document.createElement('span');
+        del.className = 'reload';
+        del.textContent = '✕';
+        del.title = '文件已被删除';
+        (function (path) {
+          del.addEventListener('click', function (ev) { ev.stopPropagation(); closeTab(path, true); });
+        })(t.path);
+        tab.appendChild(del);
+      } else if (t.diskChanged) {
+        var rb = document.createElement('span');
+        rb.className = 'reload';
+        rb.textContent = '↻';
+        rb.title = '文件在磁盘上已更新（AI 修改？），点击重新加载';
+        (function (path) {
+          rb.addEventListener('click', function (ev) { ev.stopPropagation(); reloadFile(path); });
+        })(t.path);
+        tab.appendChild(rb);
+      }
       var x = document.createElement('span');
       x.className = 'x';
       x.textContent = '×';
@@ -1551,6 +1727,85 @@ body{display:flex;flex-direction:column}
     } else {
       $('sbSave').textContent = '';
     }
+  }
+
+  /* ---------- 审查 / 工作区切换 / 变更轮询 ---------- */
+  function askReview() {
+    if (!activePath) { toast('请先打开一个文件'); return; }
+    var t = tabs.find(function (x) { return x.path === activePath; });
+    var promptText = '请审查这个文件，指出问题并给出修改建议：' + activePath;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(promptText);
+    } catch (e) { /* 忽略 */ }
+    try {
+      var f = $('chatFrame');
+      if (f && f.contentWindow) f.contentWindow.focus();
+    } catch (e) { /* 忽略 */ }
+    toast('已复制审查指令（' + (t ? t.name : activePath) + '），在对话侧栏按 Ctrl+V 粘贴发送');
+  }
+  function switchRoot() {
+    var dir = prompt('输入要打开的工作区目录（绝对路径）：', currentRoot || '');
+    if (!dir || !dir.trim()) return;
+    fetch('/api/fs/root', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dir: dir.trim() })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d.error) { showErr(d.error); return; }
+        currentRoot = d.root;
+        $('rootLabel').textContent = currentRoot;
+        expandedDirs = {};
+        watchNext = 0;
+        while (tabs.length) closeTab(tabs[0].path, true);
+        refreshTree();
+        toast('已切换工作区：' + currentRoot);
+      })
+      .catch(function (e) { showErr('切换工作区失败：' + e); });
+  }
+  function pollChanges() {
+    fetch('/api/fs/changes?after=' + watchNext, { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || !d.events || !d.events.length) return;
+        watchNext = d.next || d.events.length;
+        var toClose = [];
+        var toReload = [];
+        var any = false;
+        for (var i = 0; i < d.events.length; i++) {
+          var ev = d.events[i];
+          if (!ev || !ev.path) continue;
+          any = true;
+          var matched = false;
+          for (var j = 0; j < tabs.length; j++) {
+            var tabPath = tabs[j].path;
+            if (relOf(tabPath) !== ev.path && tabPath !== ev.path) continue;
+            matched = true;
+            if (ev.kind === 'delete') {
+              tabs[j].deleted = true;
+              tabs[j].diskChanged = false;
+              if (!tabs[j].dirty && toClose.indexOf(tabPath) < 0) toClose.push(tabPath);
+            } else {
+              tabs[j].diskChanged = true;
+              tabs[j].deleted = false;
+              if (!tabs[j].dirty && toReload.indexOf(tabPath) < 0) toReload.push(tabPath);
+            }
+          }
+          if (!matched && ev.kind !== 'delete') {
+            for (var k = 0; k < tabs.length; k++) {
+              if (!tabs[k].dirty && relOf(tabs[k].path).indexOf(ev.path + '/') === 0 && toReload.indexOf(tabs[k].path) < 0) {
+                tabs[k].diskChanged = true;
+                toReload.push(tabs[k].path);
+              }
+            }
+          }
+        }
+        for (var c = 0; c < toClose.length; c++) closeTab(toClose[c], true);
+        for (var r = 0; r < toReload.length; r++) reloadFile(toReload[r], true);
+        if (any) scheduleTreeRefresh();
+      })
+      .catch(function () { /* 网络抖动忽略 */ });
   }
 
   /* ---------- 侧栏折叠 / 拖动 ---------- */
@@ -1595,6 +1850,8 @@ body{display:flex;flex-direction:column}
   $('viewChat').addEventListener('click', function () { location.href = '/'; });
   $('viewCode').addEventListener('click', function () { /* 已在代码视图 */ });
   $('refreshTree').addEventListener('click', refreshTree);
+  $('switchRoot').addEventListener('click', switchRoot);
+  $('askReview').addEventListener('click', askReview);
   document.addEventListener('keydown', function (e) {
     if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); saveFile(); }
     if ((e.ctrlKey || e.metaKey) && e.key === 'b') { e.preventDefault(); location.href = '/'; }
@@ -1604,8 +1861,11 @@ body{display:flex;flex-direction:column}
     try {
       var root = await (await fetch('/api/fs/tree?dir=.', { cache: 'no-store' })).json();
       if (root.error) { showErr(root.error); }
-      else { $('rootLabel').textContent = root.root; loadDir(root.root, $('tree')); }
+      else { currentRoot = root.root; $('rootLabel').textContent = root.root; loadDir(root.root, $('tree')); }
     } catch (e) { showErr('初始化失败：' + e); }
+    // 激活磁盘变更感知并启动轮询（AI 改文件 → 标签提示 / 自动刷新）
+    fetch('/api/fs/watch', { method: 'POST' }).catch(function () { });
+    setInterval(pollChanges, 3000);
     var ok = await loadMonaco();
     if (ok) {
       monacoReady = true;
@@ -1942,6 +2202,7 @@ function apply(ctx, config) {
         path: "/api/fs/write",
         handler: async (req, res) => {
           if (req.method !== "POST") return json(res, { error: "需要 POST" }, 405);
+          if (!sameOrigin(req)) return json(res, { error: "非本机来源" }, 403);
           let body;
           try {
             body = JSON.parse(await readBody(req));
@@ -1952,6 +2213,70 @@ function apply(ctx, config) {
         },
       }),
     "desktop-tools: fs write api",
+  );
+
+  // 编辑器变更感知：激活扫描 / 拉取增量变更 / 查询与切换工作区根目录
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: "exact",
+        path: "/api/fs/watch",
+        handler: async (_req, res) => {
+          touchFsWatcher();
+          json(res, { ok: true });
+        },
+      }),
+    "desktop-tools: fs watch api",
+  );
+
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: "exact",
+        path: "/api/fs/changes",
+        handler: async (req, res) => {
+          touchFsWatcher();
+          const after = Number(qs(req).get("after") ?? 0) || 0;
+          json(res, { events: changeEvents.slice(after), next: changeEvents.length });
+        },
+      }),
+    "desktop-tools: fs changes api",
+  );
+
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: "exact",
+        path: "/api/fs/root",
+        handler: async (req, res) => {
+          if (req.method === "POST") {
+            if (!sameOrigin(req)) return json(res, { error: "非本机来源" }, 403);
+            let body;
+            try {
+              body = JSON.parse(await readBody(req));
+            } catch (e) {
+              return json(res, { error: `请求体解析失败：${e.message}` }, 400);
+            }
+            const dir = String(body.dir ?? "").trim();
+            if (!dir) return json(res, { error: "缺少目录" }, 400);
+            let st;
+            try {
+              st = statSync(dir);
+            } catch {
+              return json(res, { error: "目录不存在" });
+            }
+            if (!st.isDirectory()) return json(res, { error: "不是目录" });
+            editorRoot = resolve(dir);
+            fsCache.clear();
+            changeEvents = [];
+            touchFsWatcher();
+            json(res, { root: editorRoot });
+          } else {
+            json(res, { root: editorRoot });
+          }
+        },
+      }),
+    "desktop-tools: fs root api",
   );
 }
 
