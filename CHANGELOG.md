@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1 — 2026-08-21
+
+- Ensure-host version tracking: writes a VERSION file with the release tag after download;
+  re-runs compare the stored tag against the latest release and re-download when a newer
+  version is available (fixes stale v0.1.0 binary after host v0.2.0 is released).
+
 ## 0.5.0 — 2026-08-20
 
 - Code-review loop in the code view (Codex/Qoder/WorkBuddy-style):

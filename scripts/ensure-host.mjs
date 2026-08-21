@@ -86,7 +86,7 @@ async function download(url, dest) {
   renameSync(tmp, dest);
 }
 
-/** 2) GitHub Release 下载 */
+/** 2) GitHub Release 下载（含版本检查，避免重复下载相同版本） */
 async function tryRelease(t) {
   const rel = await latestRelease();
   if (!rel || !Array.isArray(rel.assets) || rel.assets.length === 0)
@@ -95,9 +95,13 @@ async function tryRelease(t) {
   if (!asset)
     return { ok: false, reason: `Release ${rel.tag_name} 缺少资产 ${t.asset}` };
   const dest = binaryPath(t);
-  if (existsSync(dest)) return { ok: true, path: dest, source: `本地缓存（${rel.tag_name}）` };
+  const versionFile = join(hostRoot(), "VERSION");
+  const storedVersion = existsSync(versionFile) ? (() => { try { return readFileSync(versionFile, "utf8").trim(); } catch { return ""; } })() : "";
+  if (existsSync(dest) && storedVersion === rel.tag_name)
+    return { ok: true, path: dest, source: `Release ${rel.tag_name}（已缓存）` };
   mkdirSync(targetDir(t), { recursive: true });
   await download(asset.browser_download_url, dest);
+  try { writeFileSync(versionFile, rel.tag_name, "utf8"); } catch {}
   return { ok: true, path: dest, source: `Release ${rel.tag_name} 下载` };
 }
 
