@@ -137,9 +137,24 @@ async function ensure() {
     return;
   }
   const existing = binaryPath(t);
-  if (existsSync(existing)) {
-    writeStatus({ state: "ready", path: existing, source: "已存在" });
-    return;
+  const versionFile = join(hostRoot(), "VERSION");
+  const force = process.argv.includes("--force");
+  if (existsSync(existing) && !force) {
+    const storedVersion = existsSync(versionFile) ? (() => { try { return readFileSync(versionFile, "utf8").trim(); } catch { return ""; } })() : "";
+    // 若无版本记录或版本不匹配 → 从 GitHub Release 重新下载
+    try {
+      const rel = await latestRelease();
+      if (rel && rel.tag_name && rel.tag_name !== storedVersion) {
+        process.stderr.write(`[ensure-host] 发现 Release ${rel.tag_name}（本地：${storedVersion || "未知版本"}），重新下载…\n`);
+        // 继续下载（不 return）
+      } else {
+        writeStatus({ state: "ready", path: existing, source: `${storedVersion || "已缓存"}（已缓存）` });
+        return;
+      }
+    } catch {
+      writeStatus({ state: "ready", path: existing, source: `${storedVersion || "已存在"}（检查更新失败，跳过）` });
+      return;
+    }
   }
   try {
     const r = await tryRelease(t);

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.3 — 2026-08-21
+
+- ensure-host: when no VERSION file exists and binary is present, still check the latest
+  release tag; re-downloads if the stored version is empty or different (one-time
+  migration for existing installs).
+
+## 0.5.2 — 2026-08-21
+
+- ensure-host: fix stale-binary detection — now checks the stored VERSION tag against the
+  latest release when the binary already exists, and re-downloads if a newer release is
+  available; supports `--force` flag to always re-download.
+
 ## 0.5.1 — 2026-08-21
 
 - Ensure-host version tracking: writes a VERSION file with the release tag after download;
